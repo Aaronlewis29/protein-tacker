@@ -1,88 +1,94 @@
 # Macro Log
 
-A calorie and protein tracker you photograph food into. Entirely static — three files, no build step, no server, no database. Runs on GitHub Pages for free.
+A calorie and protein tracker you photograph food into. Three files, no build step, no server, no database. Runs free on GitHub Pages.
 
-Four ways to log something:
+**Total cost to run: nothing.** Hosting is free, three of the four logging modes need no account at all, and the fourth runs on Google's free tier.
 
 | Mode | How it works | Needs a key? |
 |---|---|---|
-| **Meal photo** | Photograph the plate; Claude identifies each food and estimates calories and protein | Yes |
-| **Nutrition label** | Photograph the panel on the packet; Claude transcribes the printed numbers | Yes |
-| **Barcode** | Scan the barcode; nutrition comes from the Open Food Facts public database | No |
-| **Manual** | Type it in | No |
+| **Search / add** | Type "greek yoghurt", pick from the Open Food Facts database | No |
+| **Barcode** | Scan the packet; exact nutrition from the same database | No |
+| **Meal photo** | Photograph the plate; AI identifies foods and estimates macros | Free Gemini key |
+| **Nutrition label** | Photograph the panel; AI transcribes the printed numbers | Free Gemini key |
 
-Everything you log lives in your browser's local storage. Nothing is uploaded anywhere except the image you send to Anthropic when using the two photo modes.
+Everything you log lives in your browser's local storage. Nothing is uploaded anywhere except the image you send for the two photo modes.
 
 ---
 
 ## Setup
 
-### 1. Get an Anthropic API key
-
-Create one at [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) and add a little credit to the account. You paste the key into the app's own Settings panel — **never into the code**.
-
-Rough cost: a food photo is around a third of a cent on Sonnet. Logging five meals a day for a month lands well under a dollar. Switch to Haiku in Settings to cut that further.
-
-### 2. Put it on GitHub Pages
+### 1. Put it on GitHub Pages
 
 ```bash
 git init
-git add index.html styles.css app.js README.md .gitignore
+git add .
 git commit -m "Macro Log"
 git branch -M main
 git remote add origin https://github.com/YOUR-USERNAME/macro-log.git
 git push -u origin main
 ```
 
-Then in the repo: **Settings → Pages → Source: Deploy from a branch → `main` / `(root)` → Save**.
+Then in the repo: **Settings → Pages → Source: Deploy from a branch → `main` / `(root)` → Save**. A minute later it's live at `https://YOUR-USERNAME.github.io/macro-log/`.
 
-A minute later it's live at `https://YOUR-USERNAME.github.io/macro-log/`.
+On a free GitHub account Pages only works from a **public** repo. Your API key isn't in the code, so nothing sensitive is exposed. If you'd rather keep it private, the [Student Developer Pack](https://education.github.com/pack) includes GitHub Pro free, which allows Pages from private repos.
 
-HTTPS matters here — the camera API refuses to run over plain HTTP. GitHub Pages gives you HTTPS automatically.
+HTTPS matters — the camera refuses to run over plain HTTP. GitHub Pages gives you HTTPS automatically.
 
-### 3. Open it on your phone
+### 2. Start using it — no key needed
 
-Open the URL, tap Settings, paste your key, set your daily calorie and protein targets. On iOS use Share → Add to Home Screen; on Android, Chrome's "Install app". It then behaves like a normal app.
+Open the URL. Search, barcode scanning and manual entry all work immediately. For a lot of everyday logging that's genuinely enough, and the database gives you *exact* numbers rather than estimates.
 
-The key is stored per-browser, so you'll paste it once on your phone and once on your laptop.
+### 3. Add a free Gemini key for photo modes
+
+Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free, no card. Paste it into the app's Settings panel, never into the code.
+
+The free tier allows roughly 10 requests/minute and 250/day on Flash, or 15/minute and 1,000/day on Flash-Lite. Even at five photographed meals a day you'd use about 2% of it.
+
+**One thing to weigh before photographing meals:** on Google's free tier, your prompts and images may be used to improve their models. Meal photos often catch your kitchen, your table, sometimes other people. If that bothers you, stick to barcode and search (which send nothing to any AI), or switch the provider to Anthropic in Settings, which is paid but doesn't train on API traffic.
+
+### 4. Install it on your phone
+
+iOS: Share → Add to Home Screen. Android: Chrome menu → Install app. It then opens fullscreen like a normal app.
+
+The key and your log are stored per-browser, so phone and laptop each hold their own. Use **Settings → Export JSON** on one and Import on the other to merge.
 
 ---
 
 ## Running it locally
 
-Opening `index.html` as a `file://` URL won't work — the camera and `fetch` both need a real origin. Serve it instead:
+Don't double-click `index.html` — a `file://` URL blocks both the camera and network calls, and you'll think it's broken when it isn't. Serve it:
 
 ```bash
 python3 -m http.server 8000
 ```
 
-Then visit `http://localhost:8000`. Browsers treat `localhost` as a secure context, so the camera works there too.
-
-In VS Code the Live Server extension does the same thing; in PyCharm, right-click `index.html` → Open in Browser.
+Then visit `http://localhost:8000`. Browsers treat `localhost` as a secure context, so the camera works there too. VS Code's Live Server extension does the same job.
 
 ---
 
+## Switching providers
+
+Settings has a provider dropdown (Gemini or Anthropic) and an **editable** model field. The model box is deliberately a text input rather than a dropdown: model names get retired, and when that happens you change one field instead of editing source. If a model 404s, the app tells you to change it there.
+
+Gemini is called at `generativelanguage.googleapis.com`, which permits browser requests from any origin. Anthropic requires the `anthropic-dangerous-direct-browser-access` header, which the app sends. Azure OpenAI and OpenAI's direct API both refuse browser calls entirely — no CORS headers — so neither can work in a static app without a backend proxy.
+
 ## About the API key
 
-The key sits in your browser's local storage and is sent only to `api.anthropic.com`. That is the accepted pattern for a personal static app, and Anthropic supports it deliberately via the `anthropic-dangerous-direct-browser-access` header. Two things follow from it:
+The key sits in local storage and goes only to the provider's endpoint. That's the accepted pattern for a personal static app. Two consequences: anyone with access to your browser profile can read it, so treat it like a saved password; and it belongs in Settings only — if you ever paste it into a source file and push, revoke it immediately.
 
-Anyone who can use your browser profile can read the key out of local storage, so treat it like a saved password. And the key belongs in the Settings panel only — if you ever paste it into a source file and push, GitHub's secret scanning will catch it, but by then it's public and you'll need to revoke it.
-
-Exports deliberately omit the key, so a backup file is safe to keep in cloud storage.
-
-If you later want the key off your device entirely, that needs a backend to hold it, which means somewhere other than GitHub Pages — Azure Static Web Apps has a free tier with Python functions that would suit.
+Exports deliberately omit the key, so backup files are safe to keep in cloud storage.
 
 ---
 
 ## Known limits
 
-The meal-photo numbers are **estimates**. A model judging portion size from a photo is working from the same cues you are, and it can be off by a third either way on things like oil, dressings, and anything hidden under something else. For accuracy that matters, weigh the food and use the label or manual path. The photo path is for speed, not precision.
+Meal-photo numbers are **estimates**. A model judging portions from a photo works from the same cues you do and can be off by a third on oils, dressings, and anything hidden underneath. When accuracy matters, use search, barcode, or the label reader — all of which give printed values rather than guesses.
 
-Barcode scanning uses the browser's native `BarcodeDetector` where it exists (Chrome, Edge, Android) and falls back to ZXing loaded from a CDN elsewhere, which covers iOS Safari. If the camera can't be opened at all, the modal lets you type the digits.
+Barcode scanning uses the browser's native `BarcodeDetector` where available (Chrome, Edge, Android) and falls back to ZXing from a CDN elsewhere, covering iOS Safari. If the camera won't open, you can type the digits.
 
-Open Food Facts is crowd-sourced. Coverage is strong in Europe and patchy elsewhere, and some entries have no nutrition data recorded. When a lookup misses, the app offers manual entry rather than failing. Should the browser block the request outright on CORS grounds, you'll get the same fallback — photographing the label works regardless.
+Open Food Facts is crowd-sourced: strong coverage in Europe, patchier elsewhere, and some entries lack nutrition data. Every failure path falls back to manual entry rather than dead-ending.
 
-Local storage is per-browser and per-device. There's no sync, and clearing site data wipes the log, so use **Settings → Export JSON** occasionally. Import merges by entry ID rather than overwriting, so re-importing an old backup won't create duplicates.
+Local storage is per-browser and per-device. No sync, and clearing site data wipes the log — export occasionally. Import merges by entry ID, so re-importing an old backup won't duplicate anything.
 
 ---
 
@@ -94,8 +100,10 @@ styles.css    all styling, dark and light
 app.js        state, rendering, capture flows, API calls
 ```
 
-No dependencies, no bundler. `app.js` is plain ES2022 in a classic script tag. ZXing is the only external code and it loads lazily, only if you scan a barcode on a browser lacking `BarcodeDetector`.
+No dependencies, no bundler, plain ES2022. ZXing is the only external code and it loads lazily, only when scanning a barcode on a browser without `BarcodeDetector`.
+
+One implementation note worth keeping if you edit the CSS: `[hidden] { display: none !important; }` near the top is load-bearing. The browser's own `[hidden]` rule loses to any author `display` value, so without it the modal overlay is permanently visible.
 
 ## Ideas for later
 
-Cross-device sync needs a backend and a database. Weekly and monthly averages are a small extension of the existing chart code. A "recent foods" list that lets you re-add yesterday's breakfast in one tap would probably save more time than any of the AI features.
+A "recent foods" list that re-adds yesterday's breakfast in one tap would probably save more time than any of the AI features. Weekly and monthly averages are a small extension of the chart code. Cross-device sync is the one thing that genuinely needs a backend.

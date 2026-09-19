@@ -9,17 +9,32 @@
 const STORE_KEY = 'macrolog.v1';
 const RING_C = 2 * Math.PI * 52;          // circumference of r=52 ring
 const OFF_URL = 'https://world.openfoodfacts.org/api/v2/product/';
+const OFF_SEARCH = 'https://world.openfoodfacts.org/cgi/search.pl';
 const ZXING_CDN = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
 
-const MODELS = [
-  ['claude-sonnet-5', 'Sonnet 5 — balanced (recommended)'],
-  ['claude-opus-5', 'Opus 5 — most accurate, pricier'],
-  ['claude-haiku-4-5-20251001', 'Haiku 4.5 — fastest, cheapest'],
-];
+/* Both providers allow browser-direct calls. Gemini has a free tier;
+   Anthropic is paid. Model names drift, so they stay editable in Settings. */
+const PROVIDERS = {
+  gemini: {
+    name: 'Google Gemini — free tier',
+    defaultModel: 'gemini-2.5-flash',
+    suggest: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'],
+    keyHint: 'aistudio.google.com/apikey',
+    keyUrl: 'https://aistudio.google.com/apikey',
+  },
+  anthropic: {
+    name: 'Anthropic Claude — paid',
+    defaultModel: 'claude-sonnet-5',
+    suggest: ['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5-20251001'],
+    keyHint: 'console.anthropic.com',
+    keyUrl: 'https://console.anthropic.com/settings/keys',
+  },
+};
 
 const SOURCE_LABEL = {
-  ai: 'photo', label: 'label', barcode: 'barcode', manual: 'manual',
+  ai: 'photo', label: 'label', barcode: 'barcode', search: 'database', manual: 'manual',
 };
 
 // ─────────────────────────────────────────────────────────
@@ -28,16 +43,21 @@ const SOURCE_LABEL = {
 const DEFAULTS = {
   entries: [],
   targets: { calories: 2000, protein: 150 },
-  settings: { apiKey: '', model: 'claude-sonnet-5' },
+  settings: { apiKey: '', provider: 'gemini', model: 'gemini-2.5-flash' },
 };
 
 let state = load();
 let viewDate = todayKey();
 
+// Declaration, not a const arrow: load() runs above this line.
+function freshDefaults() {
+  return JSON.parse(JSON.stringify(DEFAULTS));
+}
+
 function load() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (!raw) return structuredClone(DEFAULTS);
+    if (!raw) return freshDefaults();
     const parsed = JSON.parse(raw);
     return {
       entries: Array.isArray(parsed.entries) ? parsed.entries : [],
@@ -45,7 +65,7 @@ function load() {
       settings: { ...DEFAULTS.settings, ...(parsed.settings || {}) },
     };
   } catch {
-    return structuredClone(DEFAULTS);
+    return freshDefaults();
   }
 }
 
@@ -295,7 +315,7 @@ function spinner(container, text) {
 // ─────────────────────────────────────────────────────────
 function needKey() {
   if (state.settings.apiKey) return false;
-  toast('Add your Anthropic API key in Settings first.', true);
+  toast('Add a free Gemini API key in Settings to use photos.', true);
   openSettings();
   return true;
 }
@@ -326,7 +346,68 @@ async function shrinkImage(file, maxDim = 1100, quality = 0.82) {
   return { data: await fileToBase64(blob), mediaType: 'image/jpeg' };
 }
 
-async function askClaude(imageB64, mediaType, prompt) {
+async function askVision(imageB64, mediaType, prompt) {
+  return state.settings.provider === 'anthropic'
+    ? askAnthropic(imageB64, mediaType, prompt)
+    : askGemini(imageB64, mediaType, prompt);
+}
+
+async function apiFail(res, who) {
+  let detail = '';
+  try {
+    const j = await res.json();
+    detail = j?.error?.message || j?.[0]?.error?.message || '';
+  } catch {}
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${who} rejected the API key. Check it in Settings.`);
+  }
+  if (res.status === 429) {
+    throw new Error(who === 'Gemini'
+      ? 'Free-tier limit hit. Wait a minute, or switch to Flash-Lite in Settings.'
+      : 'Rate limited — wait a moment and retry.');
+  }
+  if (/credit|balance|quota/i.test(detail)) {
+    throw new Error(`${who} account is out of credit or quota.`);
+  }
+  if (res.status === 404) {
+    throw new Error(`Model "${state.settings.model}" not found. Change it in Settings.`);
+  }
+  throw new Error(detail || `${who} error ${res.status}`);
+}
+
+async function askGemini(imageB64, mediaType, prompt) {
+  const url = `${GEMINI_URL}${encodeURIComponent(state.settings.model)}:generateContent`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-goog-api-key': state.settings.apiKey,
+    },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { inline_data: { mime_type: mediaType, data: imageB64 } },
+          { text: prompt },
+        ],
+      }],
+      generationConfig: {
+        maxOutputTokens: 1600,
+        temperature: 0.2,
+        responseMimeType: 'application/json',
+      },
+    }),
+  });
+
+  if (!res.ok) await apiFail(res, 'Gemini');
+
+  const json = await res.json();
+  const cand = json.candidates?.[0];
+  if (!cand) throw new Error('Gemini returned nothing. Try a clearer photo.');
+  if (cand.finishReason === 'SAFETY') throw new Error('Gemini blocked that image.');
+  return (cand.content?.parts || []).map(p => p.text || '').join('');
+}
+
+async function askAnthropic(imageB64, mediaType, prompt) {
   const res = await fetch(ANTHROPIC_URL, {
     method: 'POST',
     headers: {
@@ -337,7 +418,7 @@ async function askClaude(imageB64, mediaType, prompt) {
     },
     body: JSON.stringify({
       model: state.settings.model,
-      max_tokens: 1200,
+      max_tokens: 1600,
       messages: [{
         role: 'user',
         content: [
@@ -348,14 +429,7 @@ async function askClaude(imageB64, mediaType, prompt) {
     }),
   });
 
-  if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.json())?.error?.message || ''; } catch {}
-    if (res.status === 401) throw new Error('API key rejected. Check it in Settings.');
-    if (res.status === 429) throw new Error('Rate limited — wait a moment and retry.');
-    if (res.status === 400 && /credit|balance/i.test(detail)) throw new Error('Anthropic account has no credit.');
-    throw new Error(detail || `API error ${res.status}`);
-  }
+  if (!res.ok) await apiFail(res, 'Anthropic');
 
   const json = await res.json();
   return json.content.map(b => b.text || '').join('');
@@ -399,7 +473,7 @@ function flowPhoto() {
     spinner(body, 'Identifying food…');
     try {
       const { data, mediaType } = await shrinkImage(file);
-      const raw = await askClaude(data, mediaType, MEAL_PROMPT);
+      const raw = await askVision(data, mediaType, MEAL_PROMPT);
       const parsed = extractJSON(raw);
       const items = (parsed.items || []).filter(i => i && i.name);
       if (!items.length) {
@@ -427,7 +501,7 @@ function flowLabel() {
     spinner(body, 'Reading label…');
     try {
       const { data, mediaType } = await shrinkImage(file, 1400, 0.88);
-      const raw = await askClaude(data, mediaType, LABEL_PROMPT);
+      const raw = await askVision(data, mediaType, LABEL_PROMPT);
       const d = extractJSON(raw);
       showLabelResult(body, d);
     } catch (err) {
@@ -654,7 +728,7 @@ async function lookupBarcode(body, code) {
   }
 }
 
-function showProduct(body, product, code) {
+function showProduct(body, product, code, source = 'barcode') {
   const n = product.nutriments || {};
   const cal100 = num(n['energy-kcal_100g']) ?? (num(n['energy_100g']) != null ? num(n['energy_100g']) / 4.184 : null);
   const pro100 = num(n['proteins_100g']);
@@ -733,7 +807,7 @@ function showProduct(body, product, code) {
       portion: basisEl.value === 'grams' ? `${gramsEl.value} g` : (product.serving_size || '1 serving'),
       calories: calEl.value,
       protein: proEl.value,
-      source: 'barcode',
+      source,
     });
     closeModal();
     toast('Added');
@@ -745,7 +819,117 @@ function showProduct(body, product, code) {
 // Flow: manual
 // ─────────────────────────────────────────────────────────
 function flowManual() {
-  openModal('Add manually', body => addManualForm(body, 'manual'));
+  openModal('Add manually', body => {
+    addSearchBox(body);
+
+    const hr = document.createElement('hr');
+    hr.style.cssText = 'border:0;border-top:1px solid var(--line);margin:20px 0 16px';
+    body.append(hr);
+
+    const h = document.createElement('p');
+    h.className = 'hint';
+    h.style.margin = '0 0 12px';
+    h.textContent = 'Or enter it yourself:';
+    body.append(h);
+
+    addManualForm(body, 'manual');
+  });
+}
+
+/** Free-text lookup against Open Food Facts. No key, no AI, no cost. */
+function addSearchBox(body) {
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <label for="q">Search the food database</label>
+    <div style="display:flex;gap:8px">
+      <input id="q" type="search" placeholder="e.g. greek yoghurt" enterkeyhint="search">
+      <button id="q-go" class="act" style="flex:none;padding:11px 16px">Find</button>
+    </div>
+  `;
+  body.append(wrap);
+
+  const results = document.createElement('div');
+  results.style.marginTop = '12px';
+  body.append(results);
+
+  const input = wrap.querySelector('#q');
+
+  async function go() {
+    const q = input.value.trim();
+    if (q.length < 2) { toast('Type at least two characters.', true); return; }
+
+    results.replaceChildren();
+    const loading = document.createElement('p');
+    loading.className = 'hint';
+    loading.textContent = 'Searching…';
+    results.append(loading);
+
+    try {
+      const url = `${OFF_SEARCH}?search_terms=${encodeURIComponent(q)}`
+        + '&search_simple=1&action=process&json=1&page_size=12'
+        + '&fields=code,product_name,brands,nutriments,serving_size';
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Search failed (${res.status})`);
+      const json = await res.json();
+
+      const hits = (json.products || []).filter(p =>
+        p.product_name && num(p.nutriments?.['energy-kcal_100g']) != null);
+
+      results.replaceChildren();
+      if (!hits.length) {
+        const p = document.createElement('p');
+        p.className = 'hint';
+        p.textContent = `Nothing usable found for "${q}". Try a simpler word, or enter it by hand below.`;
+        results.append(p);
+        return;
+      }
+
+      const ul = document.createElement('ul');
+      ul.className = 'found';
+      for (const prod of hits) {
+        const li = document.createElement('li');
+        li.style.cursor = 'pointer';
+
+        const main = document.createElement('div');
+        main.className = 'f-main';
+        const nm = document.createElement('div');
+        nm.className = 'f-name';
+        nm.textContent = prod.product_name;
+        const sb = document.createElement('div');
+        sb.className = 'f-sub';
+        sb.textContent = prod.brands || '';
+        main.append(nm, sb);
+
+        const nums = document.createElement('div');
+        nums.className = 'f-nums';
+        const kcal = Math.round(num(prod.nutriments['energy-kcal_100g']));
+        const pro = round1(num(prod.nutriments['proteins_100g']) || 0);
+        nums.innerHTML = '<div></div><div style="color:var(--pro)"></div>';
+        nums.children[0].textContent = `${kcal} kcal`;
+        nums.children[1].textContent = `${pro} g /100g`;
+
+        li.append(main, nums);
+        li.onclick = () => showProduct($('#modal-body'), prod, prod.code || '', 'search');
+        ul.append(li);
+      }
+      results.append(ul);
+
+      const note = document.createElement('p');
+      note.className = 'hint';
+      note.textContent = 'Tap one to choose your portion.';
+      results.append(note);
+    } catch (err) {
+      results.replaceChildren();
+      const p = document.createElement('p');
+      p.className = 'hint';
+      p.textContent = 'Could not reach the food database. Enter it by hand below.';
+      results.append(p);
+      console.warn('Open Food Facts search failed:', err);
+    }
+  }
+
+  wrap.querySelector('#q-go').onclick = go;
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
 }
 
 function addManualForm(body, source, prefillName = '') {
@@ -903,14 +1087,21 @@ function openSettings() {
     const wrap = document.createElement('div');
     wrap.className = 'stack';
     wrap.innerHTML = `
+      <p class="note">Barcode scanning, food search and manual entry all work with no key at all. A key is only needed for the two photo modes.</p>
       <div>
-        <label for="s-key">Anthropic API key</label>
-        <input id="s-key" type="password" placeholder="sk-ant-..." autocomplete="off">
-        <p class="hint">Stored only in this browser's local storage. Never sent anywhere except api.anthropic.com. Get one at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
+        <label for="s-provider">Photo recognition by</label>
+        <select id="s-provider"></select>
+      </div>
+      <div>
+        <label for="s-key">API key</label>
+        <input id="s-key" type="password" placeholder="paste key" autocomplete="off">
+        <p class="hint" id="s-keyhint"></p>
       </div>
       <div>
         <label for="s-model">Model</label>
-        <select id="s-model"></select>
+        <input id="s-model" type="text" list="s-models" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <datalist id="s-models"></datalist>
+        <p class="hint">Editable on purpose — if a model name is retired, change it here instead of editing code.</p>
       </div>
       <div class="row">
         <div><label for="s-cal">Daily calories</label><input id="s-cal" type="number" min="0" step="10"></div>
@@ -919,16 +1110,45 @@ function openSettings() {
     `;
     body.append(wrap);
 
+    const provEl = wrap.querySelector('#s-provider');
     const keyEl = wrap.querySelector('#s-key');
+    const hintEl = wrap.querySelector('#s-keyhint');
     const modelEl = wrap.querySelector('#s-model');
+    const listEl = wrap.querySelector('#s-models');
     const calEl = wrap.querySelector('#s-cal');
     const proEl = wrap.querySelector('#s-pro');
 
+    for (const [id, p] of Object.entries(PROVIDERS)) provEl.append(new Option(p.name, id));
+    provEl.value = PROVIDERS[state.settings.provider] ? state.settings.provider : 'gemini';
     keyEl.value = state.settings.apiKey;
-    for (const [v, t] of MODELS) modelEl.append(new Option(t, v));
     modelEl.value = state.settings.model;
     calEl.value = state.targets.calories;
     proEl.value = state.targets.protein;
+
+    let lastProvider = provEl.value;
+    function syncProvider(resetModel) {
+      const p = PROVIDERS[provEl.value];
+      listEl.replaceChildren();
+      for (const m of p.suggest) listEl.append(new Option(m));
+      if (resetModel) modelEl.value = p.defaultModel;
+      hintEl.replaceChildren();
+      hintEl.append(document.createTextNode('Stored only in this browser. Get one at '));
+      const a = document.createElement('a');
+      a.href = p.keyUrl;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = p.keyHint;
+      hintEl.append(a, document.createTextNode(
+        provEl.value === 'gemini'
+          ? '. The free tier is ample for personal use, but Google may use free-tier images to improve its models — see the README before photographing anything private.'
+          : '. Paid — needs credit on the account.'
+      ));
+    }
+    provEl.onchange = () => {
+      syncProvider(provEl.value !== lastProvider);
+      lastProvider = provEl.value;
+    };
+    syncProvider(false);
 
     const saveBtn = document.createElement('button');
     saveBtn.className = 'primary';
@@ -937,7 +1157,8 @@ function openSettings() {
     saveBtn.style.marginTop = '18px';
     saveBtn.onclick = () => {
       state.settings.apiKey = keyEl.value.trim();
-      state.settings.model = modelEl.value;
+      state.settings.provider = provEl.value;
+      state.settings.model = modelEl.value.trim() || PROVIDERS[provEl.value].defaultModel;
       state.targets.calories = Math.max(0, Number(calEl.value) || 0);
       state.targets.protein = Math.max(0, Number(proEl.value) || 0);
       save();
