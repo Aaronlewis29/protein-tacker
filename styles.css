@@ -39,6 +39,13 @@ body {
   padding-bottom: env(safe-area-inset-bottom);
 }
 
+.brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+
+/* The brand mark keeps its own two colours, set as attributes on the SVG.
+   It is excluded from the generic icon rule further down by class. */
+.brand-mark { width: 24px; height: 24px; flex: none; }
+.brand-mark circle { fill: none; stroke-linecap: round; }
+
 h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 h1 { font-size: 1.15rem; }
 h2 { font-size: 0.95rem; }
@@ -152,7 +159,12 @@ button { font: inherit; cursor: pointer; }
 .act:active { transform: translateY(1px); }
 .act svg { width: 18px; height: 18px; flex: none; }
 
-svg[viewBox] path, svg[viewBox] circle {
+/* Button/icon glyphs only. `svg[viewBox] circle` scores (0,1,2), which beats
+   `.ring-bg` (0,1,0) and the shared `stroke-width: 11` — that flattened the
+   progress rings to hairline currentColor circles. Excluding them by class
+   stops the rule matching rather than fighting it with specificity. */
+svg[viewBox]:not(.ring):not(.brand-mark) path,
+svg[viewBox]:not(.ring):not(.brand-mark) circle {
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;

@@ -92,6 +92,23 @@ Local storage is per-browser and per-device. No sync, and clearing site data wip
 
 ---
 
+## Logo and icons
+
+The mark is the app's own two progress rings: a 75% orange arc for calories around a 50% green arc for protein.
+
+```
+icons/logo.svg               master, transparent
+icons/favicon.svg            thicker strokes so it survives 16x16
+icons/apple-touch-icon.png   180px, opaque — iOS ignores transparency
+icons/icon-192.png           Android / PWA
+icons/icon-512.png           Android / PWA
+icons/icon-maskable-512.png  extra padding for Android's circular crop
+icons/logo-512.png           transparent, for docs
+site.webmanifest             name, colours and icon set for "Install app"
+```
+
+The PNGs are generated rather than drawn: ImageMagick's built-in SVG renderer mangles this file and there's no librsvg, so they're rasterised with Pillow at 8x and downsampled. If you restyle the logo, regenerate them rather than scaling by hand.
+
 ## File layout
 
 ```
@@ -102,7 +119,11 @@ app.js        state, rendering, capture flows, API calls
 
 No dependencies, no bundler, plain ES2022. ZXing is the only external code and it loads lazily, only when scanning a barcode on a browser without `BarcodeDetector`.
 
-One implementation note worth keeping if you edit the CSS: `[hidden] { display: none !important; }` near the top is load-bearing. The browser's own `[hidden]` rule loses to any author `display` value, so without it the modal overlay is permanently visible.
+Two CSS notes worth keeping if you edit `styles.css`, both of them cascade traps that already bit once:
+
+`[hidden] { display: none !important; }` near the top is load-bearing. The browser's own `[hidden]` rule loses to any author `display` value, so without it the modal overlay is permanently visible. The overlay also carries an inline `display:none` and JS sets `display` inline, so it stays correct even if this stylesheet is stale in cache.
+
+The generic icon rule is written as `svg[viewBox]:not(.ring):not(.brand-mark)`. Without those exclusions it scores (0,1,2) and beats `.ring-bg` at (0,1,0), repainting the progress rings in `currentColor` at `stroke-width: 1.8` — thin grey circles instead of thick orange and green bands. Keep any new multi-coloured SVG out of that rule the same way.
 
 ## Ideas for later
 

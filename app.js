@@ -276,14 +276,30 @@ function openModal(title, buildBody, onClose) {
   $('#modal-title').textContent = title;
   const body = $('#modal-body');
   body.replaceChildren();
-  buildBody(body);
-  $('#overlay').hidden = false;
+  // Set the hook BEFORE buildBody: flows that own a camera stream replace it
+  // with their own teardown, and assigning afterwards would wipe that out.
   onCloseHook = onClose || null;
+
+  // Make the overlay visible BEFORE building. Safari refuses to play a <video>
+  // that sits inside a display:none subtree, so starting the camera from
+  // buildBody while the modal was still hidden made play() reject.
+  // Both happen in one task, so nothing flashes.
+  showOverlay(true);
   document.body.style.overflow = 'hidden';
+  buildBody(body);
+}
+
+/* Inline style, not just the `hidden` attribute. An inline declaration beats
+   any stylesheet rule, so the modal behaves correctly even if styles.css is
+   stale in cache or fails to load at all. */
+function showOverlay(show) {
+  const ov = $('#overlay');
+  ov.hidden = !show;
+  ov.style.display = show ? 'flex' : 'none';
 }
 
 function closeModal() {
-  $('#overlay').hidden = true;
+  showOverlay(false);
   document.body.style.overflow = '';
   if (onCloseHook) { try { onCloseHook(); } catch {} onCloseHook = null; }
   $('#modal-body').replaceChildren();
@@ -333,17 +349,52 @@ async function fileToBase64(file) {
 
 /** Downscale so we do not ship a 12 MP phone photo to the API. */
 async function shrinkImage(file, maxDim = 1100, quality = 0.82) {
-  const bitmap = await createImageBitmap(file);
-  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
-  const w = Math.round(bitmap.width * scale);
-  const h = Math.round(bitmap.height * scale);
+  const src = await decodeImage(file);
+  const scale = Math.min(1, maxDim / Math.max(src.width, src.height));
+  const w = Math.max(1, Math.round(src.width * scale));
+  const h = Math.max(1, Math.round(src.height * scale));
+
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-  bitmap.close?.();
+  canvas.getContext('2d').drawImage(src.image, 0, 0, w, h);
+  src.release();
+
   const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', quality));
+  if (!blob) throw new Error('Could not process that image. Try a JPEG or PNG.');
   return { data: await fileToBase64(blob), mediaType: 'image/jpeg' };
+}
+
+/** createImageBitmap is fastest but chokes on some formats (notably HEIC from
+    iPhones in non-Safari browsers). Fall back to decoding via an <img>. */
+async function decodeImage(file) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bmp = await createImageBitmap(file);
+      return { image: bmp, width: bmp.width, height: bmp.height, release: () => bmp.close?.() };
+    } catch { /* fall through */ }
+  }
+
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error(
+        'This browser could not read that image. If it came from an iPhone it may be HEIC — '
+        + 'set Camera to "Most Compatible" in iOS Settings, or take the shot inside this app.'));
+      el.src = url;
+    });
+    return {
+      image: img,
+      width: img.naturalWidth,
+      height: img.naturalHeight,
+      release: () => URL.revokeObjectURL(url),
+    };
+  } catch (err) {
+    URL.revokeObjectURL(url);
+    throw err;
+  }
 }
 
 async function askVision(imageB64, mediaType, prompt) {
@@ -606,7 +657,12 @@ function showLabelResult(body, d) {
 function flowBarcode() {
   openModal('Scan barcode', body => {
     const video = document.createElement('video');
+    // Safari needs these as attributes, not just properties, or it refuses
+    // to autoplay the stream and opens fullscreen instead.
     video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    video.setAttribute('muted', '');
+    video.setAttribute('autoplay', '');
     video.muted = true;
     body.append(video);
 
@@ -648,20 +704,22 @@ function flowBarcode() {
     onCloseHook = stop;
 
     (async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' },
-        });
+      const useZxing = !('BarcodeDetector' in window);
+
+      // ZXing opens its own stream, so don't take the camera twice.
+      if (!useZxing) {
+        try {
+          stream = await openCamera();
+        } catch (err) {
+          cameraFailed(hint, video, err);
+          return;
+        }
         if (stopped) { stream.getTracks().forEach(t => t.stop()); return; }
         video.srcObject = stream;
-        await video.play();
-      } catch {
-        hint.textContent = 'Camera unavailable. Type the barcode digits instead.';
-        video.remove();
-        return;
-      }
+        // A rejected play() is not fatal — frames can still be grabbed from
+        // the attached stream, so warn rather than tearing the scanner down.
+        try { await video.play(); } catch (e) { console.warn('video.play() rejected:', e); }
 
-      if ('BarcodeDetector' in window) {
         const det = new window.BarcodeDetector({
           formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128'],
         });
@@ -674,20 +732,84 @@ function flowBarcode() {
           rafId = requestAnimationFrame(tick);
         };
         rafId = requestAnimationFrame(tick);
-      } else {
-        try {
-          await loadScript(ZXING_CDN);
-          if (stopped) return;
-          zxingReader = new window.ZXing.BrowserMultiFormatReader();
-          zxingReader.decodeFromVideoElement(video, (result) => {
-            if (result && !stopped) { stop(); lookupBarcode(body, result.getText()); }
-          });
-        } catch {
-          hint.textContent = 'Scanner could not load. Type the barcode digits instead.';
+        return;
+      }
+
+      // Safari and Firefox have no BarcodeDetector — fall back to ZXing.
+      if (!navigator.mediaDevices?.getUserMedia) {
+        cameraFailed(hint, video, new Error('nomediadevices'));
+        return;
+      }
+      try {
+        await loadScript(ZXING_CDN);
+      } catch {
+        hint.textContent = 'Scanner library could not load (offline, or a blocker stopped the CDN). Type the digits instead.';
+        video.remove();
+        return;
+      }
+      if (stopped) return;
+
+      try {
+        zxingReader = new window.ZXing.BrowserMultiFormatReader();
+        const onResult = (result, err) => {
+          if (result && !stopped) { stop(); lookupBarcode(body, result.getText()); }
+        };
+        // decodeFromConstraints lets us ask for the rear camera; older builds
+        // of the library only have decodeFromVideoDevice.
+        if (typeof zxingReader.decodeFromConstraints === 'function') {
+          await zxingReader.decodeFromConstraints(
+            { video: { facingMode: { ideal: 'environment' } } }, video, onResult);
+        } else {
+          await zxingReader.decodeFromVideoDevice(null, video, onResult);
         }
+      } catch (err) {
+        cameraFailed(hint, video, err);
       }
     })();
   });
+}
+
+/** Rear camera if there is one, otherwise whatever camera exists. */
+async function openCamera() {
+  if (!window.isSecureContext) throw new Error('insecure');
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('nomediadevices');
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } },
+    });
+  } catch (err) {
+    // A laptop has no rear camera; retry unconstrained before giving up.
+    if (err?.name === 'OverconstrainedError' || err?.name === 'NotFoundError') {
+      return navigator.mediaDevices.getUserMedia({ video: true });
+    }
+    throw err;
+  }
+}
+
+/** Say WHY the camera failed — "unavailable" is not actionable. */
+function cameraFailed(hint, video, err) {
+  const name = err?.name || '';
+  const msg = String(err?.message || '');
+  let text;
+
+  if (msg === 'insecure' || msg === 'nomediadevices' || !window.isSecureContext) {
+    text = `Camera blocked: this page is on ${location.protocol}//${location.hostname}. `
+         + 'Browsers only allow camera access over https:// or on localhost. '
+         + 'Open the GitHub Pages URL instead of an IP address.';
+  } else if (name === 'NotAllowedError' || name === 'SecurityError') {
+    text = 'Camera permission was denied. Allow it for this site in your browser settings, then reopen this.';
+  } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+    text = 'No camera found on this device.';
+  } else if (name === 'NotReadableError' || name === 'AbortError') {
+    text = 'The camera is already in use by another app. Close that app and try again.';
+  } else {
+    text = `Camera error: ${name || 'unknown'}${msg ? ` — ${msg}` : ''}.`;
+  }
+
+  hint.textContent = `${text} You can still type the barcode digits below.`;
+  hint.style.color = 'var(--danger)';
+  video.remove();
+  console.warn('Camera failure:', err);
 }
 
 function loadScript(src) {
@@ -1070,12 +1192,25 @@ function pickImage(handler, title) {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = 'image/*';
-  input.capture = 'environment';
+  // No `capture` attribute: setting it forces the camera and removes the
+  // option to choose an existing photo, and on desktop it can leave the
+  // picker with no usable source at all.
+  input.style.cssText = 'position:fixed;left:-9999px;opacity:0';
+
   input.onchange = () => {
     const file = input.files?.[0];
+    input.remove();
     if (!file) return;
+    if (!/^image\//.test(file.type) && !/\.(jpe?g|png|webp|heic|heif)$/i.test(file.name)) {
+      toast('That file is not an image.', true);
+      return;
+    }
     openModal(title, body => handler(file, body));
   };
+
+  // iOS Safari can skip the change event for an input that was never in the
+  // document, so attach it before clicking.
+  document.body.append(input);
   input.click();
 }
 
@@ -1195,7 +1330,78 @@ function openSettings() {
     warn.className = 'hint';
     warn.textContent = `${state.entries.length} entries stored in this browser. Clearing site data erases them — export a backup now and then.`;
     body.append(warn);
+
+    addDiagnostics(body);
   });
+}
+
+/** What this browser actually supports. Turns "it doesn't work" into a fact. */
+function addDiagnostics(body) {
+  const hr = document.createElement('hr');
+  hr.style.cssText = 'border:0;border-top:1px solid var(--line);margin:20px 0 14px';
+  body.append(hr);
+
+  const h = document.createElement('div');
+  h.style.cssText = 'font-size:.82rem;font-weight:600;margin-bottom:8px';
+  h.textContent = 'Diagnostics';
+  body.append(h);
+
+  const secure = window.isSecureContext;
+  const hasCam = !!navigator.mediaDevices?.getUserMedia;
+  const rows = [
+    ['Page address', `${location.protocol}//${location.host || 'file'}`],
+    ['Secure context', secure ? 'yes' : 'NO — camera will be blocked'],
+    ['Camera API', hasCam ? 'available' : 'MISSING'],
+    ['Barcode scanner', 'BarcodeDetector' in window ? 'native' : 'ZXing fallback (needs internet)'],
+    ['Image decoding', typeof createImageBitmap === 'function' ? 'fast path' : 'fallback path'],
+    ['API key', state.settings.apiKey ? `set (${state.settings.apiKey.length} chars)` : 'not set — photo modes disabled'],
+    ['Provider', `${state.settings.provider} / ${state.settings.model}`],
+  ];
+
+  const tbl = document.createElement('div');
+  tbl.style.cssText = 'font-size:.78rem;line-height:1.7';
+  for (const [k, v] of rows) {
+    const bad = /NO|MISSING|not set/.test(v);
+    const line = document.createElement('div');
+    line.style.cssText = 'display:flex;gap:10px;justify-content:space-between';
+    const a = document.createElement('span');
+    a.style.color = 'var(--muted)';
+    a.textContent = k;
+    const b = document.createElement('span');
+    b.style.cssText = `text-align:right;${bad ? 'color:var(--danger);font-weight:600' : ''}`;
+    b.textContent = v;
+    line.append(a, b);
+    tbl.append(line);
+  }
+  body.append(tbl);
+
+  const test = document.createElement('button');
+  test.className = 'act';
+  test.type = 'button';
+  test.style.marginTop = '12px';
+  test.textContent = 'Test camera';
+  test.onclick = async () => {
+    test.disabled = true;
+    test.textContent = 'Testing…';
+    try {
+      const s = await openCamera();
+      const label = s.getVideoTracks()[0]?.label || 'camera';
+      s.getTracks().forEach(t => t.stop());
+      test.textContent = `Camera works: ${label}`.slice(0, 44);
+      test.style.color = 'var(--pro)';
+    } catch (err) {
+      const fake = { textContent: '', style: {} };
+      cameraFailed(fake, { remove() {} }, err);
+      test.textContent = 'Camera failed — see below';
+      test.style.color = 'var(--danger)';
+      const p = document.createElement('p');
+      p.className = 'hint';
+      p.style.color = 'var(--danger)';
+      p.textContent = fake.textContent;
+      test.after(p);
+    }
+  };
+  body.append(test);
 }
 
 function exportData() {
