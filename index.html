@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Macro Log</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍽️</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <h1>Macro Log</h1>
+  <button id="btn-settings" class="icon-btn" aria-label="Settings" title="Settings">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z"/><path d="M19.4 13a7.8 7.8 0 0 0 0-2l2-1.5-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3.5h-4l-.3 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.8 7.8 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a7.6 7.6 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7.6 7.6 0 0 0 1.7-1l2.4 1 2-3.4Z"/></svg>
+  </button>
+</header>
+
+<main>
+
+  <!-- ── Today ─────────────────────────────────────────── -->
+  <section class="card" aria-labelledby="today-h">
+    <div class="card-head">
+      <h2 id="today-h">Today</h2>
+      <span id="today-date" class="muted"></span>
+    </div>
+
+    <div class="rings">
+      <figure class="ring-wrap">
+        <svg class="ring" viewBox="0 0 120 120" role="img" aria-labelledby="cal-label">
+          <circle class="ring-bg" cx="60" cy="60" r="52"/>
+          <circle id="ring-cal" class="ring-fg cal" cx="60" cy="60" r="52"/>
+        </svg>
+        <figcaption>
+          <strong id="cal-now">0</strong><span class="muted" id="cal-goal">/ 2000</span>
+          <em id="cal-label">kcal</em>
+        </figcaption>
+      </figure>
+
+      <figure class="ring-wrap">
+        <svg class="ring" viewBox="0 0 120 120" role="img" aria-labelledby="pro-label">
+          <circle class="ring-bg" cx="60" cy="60" r="52"/>
+          <circle id="ring-pro" class="ring-fg pro" cx="60" cy="60" r="52"/>
+        </svg>
+        <figcaption>
+          <strong id="pro-now">0</strong><span class="muted" id="pro-goal">/ 150</span>
+          <em id="pro-label">g protein</em>
+        </figcaption>
+      </figure>
+    </div>
+
+    <div class="actions">
+      <button class="act" data-act="photo">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h3l1.5-2h7L17 7h3v12H4z"/><circle cx="12" cy="13" r="3.4"/></svg>
+        Meal photo
+      </button>
+      <button class="act" data-act="label">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h14v18H5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+        Nutrition label
+      </button>
+      <button class="act" data-act="barcode">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5v14M6.5 5v14M10 5v10M13.5 5v14M17 5v10M20.5 5v14"/></svg>
+        Barcode
+      </button>
+      <button class="act" data-act="manual">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        Manual
+      </button>
+    </div>
+  </section>
+
+  <!-- ── Entries ───────────────────────────────────────── -->
+  <section class="card" aria-labelledby="log-h">
+    <div class="card-head">
+      <h2 id="log-h">Log</h2>
+      <button id="btn-prev" class="ghost" aria-label="Previous day">&larr;</button>
+      <button id="btn-next" class="ghost" aria-label="Next day">&rarr;</button>
+    </div>
+    <ul id="entries" class="entries"></ul>
+    <p id="empty" class="empty">Nothing logged yet. Use a button above to add your first item.</p>
+  </section>
+
+  <!-- ── Week ──────────────────────────────────────────── -->
+  <section class="card" aria-labelledby="week-h">
+    <div class="card-head">
+      <h2 id="week-h">Last 7 days</h2>
+      <div class="legend">
+        <span class="key cal"></span>kcal
+        <span class="key pro"></span>protein
+      </div>
+    </div>
+    <div id="chart" class="chart"></div>
+    <p id="week-avg" class="muted small"></p>
+  </section>
+
+</main>
+
+<!-- ── Modal ───────────────────────────────────────────── -->
+<div id="overlay" class="overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head">
+      <h2 id="modal-title">Add</h2>
+      <button id="btn-close" class="icon-btn" aria-label="Close">&times;</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
