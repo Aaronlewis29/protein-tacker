@@ -403,27 +403,46 @@ async function askVision(imageB64, mediaType, prompt) {
     : askGemini(imageB64, mediaType, prompt);
 }
 
+/* Never swallow the provider's own message — Google in particular returns
+   very specific 403s (API disabled, referrer blocked, key restricted) that
+   each need a different fix. Lead with the likely cause, then quote them. */
 async function apiFail(res, who) {
   let detail = '';
   try {
     const j = await res.json();
     detail = j?.error?.message || j?.[0]?.error?.message || '';
   } catch {}
-  if (res.status === 401 || res.status === 403) {
-    throw new Error(`${who} rejected the API key. Check it in Settings.`);
-  }
-  if (res.status === 429) {
-    throw new Error(who === 'Gemini'
+
+  const d = detail.toLowerCase();
+  let lead;
+
+  if (/has not been used in project|is disabled|enable the api|serviceusage/.test(d)) {
+    lead = 'The Generative Language API is not enabled on the key\'s Google Cloud project. '
+         + 'Open the link in the error below and click Enable, then wait a minute.';
+  } else if (/referer|referrer|not authorized to use this api|api_key_http_referrer/.test(d)) {
+    lead = 'This key is restricted to certain websites and your page is not on the list. '
+         + 'In Google AI Studio or Cloud Console, either remove the restriction or add '
+         + `"${location.origin}/*" to the allowed referrers.`;
+  } else if (/api key not valid|invalid api key|api_key_invalid/.test(d)) {
+    lead = 'Google says the key itself is not valid. Re-copy it from aistudio.google.com/apikey — '
+         + 'keys start with "AIza" and are about 39 characters.';
+  } else if (/expired/.test(d)) {
+    lead = 'This key has expired. Create a new one.';
+  } else if (res.status === 401 || res.status === 403) {
+    lead = `${who} refused the request (${res.status}).`;
+  } else if (res.status === 429) {
+    lead = who === 'Gemini'
       ? 'Free-tier limit hit. Wait a minute, or switch to Flash-Lite in Settings.'
-      : 'Rate limited — wait a moment and retry.');
+      : 'Rate limited — wait a moment and retry.';
+  } else if (res.status === 404) {
+    lead = `Model "${state.settings.model}" was not found. Change it in Settings.`;
+  } else if (/credit|balance|quota/.test(d)) {
+    lead = `${who} account is out of credit or quota.`;
+  } else {
+    lead = `${who} error ${res.status}.`;
   }
-  if (/credit|balance|quota/i.test(detail)) {
-    throw new Error(`${who} account is out of credit or quota.`);
-  }
-  if (res.status === 404) {
-    throw new Error(`Model "${state.settings.model}" not found. Change it in Settings.`);
-  }
-  throw new Error(detail || `${who} error ${res.status}`);
+
+  throw new Error(detail && !lead.includes(detail) ? `${lead}\n\nGoogle said: ${detail}` : lead);
 }
 
 async function askGemini(imageB64, mediaType, prompt) {
@@ -1291,7 +1310,12 @@ function openSettings() {
     saveBtn.textContent = 'Save';
     saveBtn.style.marginTop = '18px';
     saveBtn.onclick = () => {
-      state.settings.apiKey = keyEl.value.trim();
+      // Strip ALL whitespace, not just the ends: copying from a web page or a
+      // wrapped terminal line can embed spaces or newlines mid-key.
+      const key = keyEl.value.replace(/\s+/g, '');
+      const warn = keyProblem(key, provEl.value);
+      if (warn) { toast(warn, true); keyEl.focus(); return; }
+      state.settings.apiKey = key;
       state.settings.provider = provEl.value;
       state.settings.model = modelEl.value.trim() || PROVIDERS[provEl.value].defaultModel;
       state.targets.calories = Math.max(0, Number(calEl.value) || 0);
@@ -1335,6 +1359,57 @@ function openSettings() {
   });
 }
 
+/** Catch the obvious paste mistakes before a round trip to the API. */
+function keyProblem(key, provider) {
+  if (!key) return null;                       // empty is allowed — no photo modes
+  if (provider === 'gemini') {
+    if (key.startsWith('sk-ant-')) return 'That is an Anthropic key. Switch the provider, or paste a Gemini key.';
+    if (key.startsWith('sk-')) return 'That looks like an OpenAI key, which this app cannot use.';
+    if (!key.startsWith('AIza')) return 'Gemini keys start with "AIza". Re-copy it from aistudio.google.com/apikey.';
+    if (key.length < 30) return `That key looks truncated (${key.length} characters; expected about 39).`;
+  }
+  if (provider === 'anthropic') {
+    if (key.startsWith('AIza')) return 'That is a Gemini key. Switch the provider, or paste an Anthropic key.';
+    if (!key.startsWith('sk-ant-')) return 'Anthropic keys start with "sk-ant-".';
+  }
+  return null;
+}
+
+/** Minimal text-only call: proves the key works without spending an image. */
+async function testKey() {
+  const { provider, apiKey, model } = state.settings;
+  if (!apiKey) throw new Error('No API key saved yet.');
+
+  if (provider === 'gemini') {
+    const res = await fetch(`${GEMINI_URL}${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'Reply with the single word: ok' }] }],
+        generationConfig: { maxOutputTokens: 10 },
+      }),
+    });
+    if (!res.ok) await apiFail(res, 'Gemini');
+    return `Key works with ${model}.`;
+  }
+
+  const res = await fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model, max_tokens: 10,
+      messages: [{ role: 'user', content: 'Reply with the single word: ok' }],
+    }),
+  });
+  if (!res.ok) await apiFail(res, 'Anthropic');
+  return `Key works with ${model}.`;
+}
+
 /** What this browser actually supports. Turns "it doesn't work" into a fact. */
 function addDiagnostics(body) {
   const hr = document.createElement('hr');
@@ -1374,6 +1449,33 @@ function addDiagnostics(body) {
     tbl.append(line);
   }
   body.append(tbl);
+
+  const keyBtn = document.createElement('button');
+  keyBtn.className = 'act';
+  keyBtn.type = 'button';
+  keyBtn.style.marginTop = '12px';
+  keyBtn.textContent = 'Test API key';
+  keyBtn.onclick = async () => {
+    document.getElementById('key-result')?.remove();
+    keyBtn.disabled = true;
+    keyBtn.textContent = 'Testing…';
+    const out = document.createElement('p');
+    out.id = 'key-result';
+    out.className = 'hint';
+    out.style.whiteSpace = 'pre-wrap';
+    try {
+      out.textContent = await testKey();
+      out.style.color = 'var(--pro)';
+      keyBtn.textContent = 'Test API key';
+    } catch (err) {
+      out.textContent = err.message;
+      out.style.color = 'var(--danger)';
+      keyBtn.textContent = 'Test API key';
+    }
+    keyBtn.disabled = false;
+    keyBtn.after(out);
+  };
+  body.append(keyBtn);
 
   const test = document.createElement('button');
   test.className = 'act';
