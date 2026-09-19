@@ -42,6 +42,12 @@ Open the URL. Search, barcode scanning and manual entry all work immediately. Fo
 
 Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free, no card. Paste it into the app's Settings panel, never into the code.
 
+Keys issued now are **auth keys** and start with `AQ.Ab`. The older **standard keys** starting with `AIza` were phased out during 2026 and Google rejects them, so if you have one lying around from an older project, create a fresh key rather than reusing it. The app warns about this but never blocks you — key formats change, and only the API can say for certain whether a key works.
+
+Then press **Find** next to the Model box. Google retires model names on a rolling basis (2.0 Flash was shut off in June 2026 and now returns 404), so rather than trusting a hardcoded default, the app asks your key which models it can actually use and picks the best current Flash one. Do this again if photo modes ever start failing with a "model not found" error.
+
+Settings also has a **Diagnostics** section with **Test API key** and **Test camera** buttons. The key test is a tiny text-only call — it costs nothing and reports Google's exact response, which is far more useful than a generic failure.
+
 The free tier allows roughly 10 requests/minute and 250/day on Flash, or 15/minute and 1,000/day on Flash-Lite. Even at five photographed meals a day you'd use about 2% of it.
 
 **One thing to weigh before photographing meals:** on Google's free tier, your prompts and images may be used to improve their models. Meal photos often catch your kitchen, your table, sometimes other people. If that bothers you, stick to barcode and search (which send nothing to any AI), or switch the provider to Anthropic in Settings, which is paid but doesn't train on API traffic.

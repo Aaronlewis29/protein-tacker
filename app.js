@@ -6,6 +6,7 @@
 // ─────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────
+const APP_VERSION = 9;   // must match the ?v= in index.html
 const STORE_KEY = 'macrolog.v1';
 const RING_C = 2 * Math.PI * 52;          // circumference of r=52 ring
 const OFF_URL = 'https://world.openfoodfacts.org/api/v2/product/';
@@ -13,14 +14,18 @@ const OFF_SEARCH = 'https://world.openfoodfacts.org/cgi/search.pl';
 const ZXING_CDN = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
+const GEMINI_LIST = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 /* Both providers allow browser-direct calls. Gemini has a free tier;
    Anthropic is paid. Model names drift, so they stay editable in Settings. */
 const PROVIDERS = {
   gemini: {
+    // Only a starting guess. Google retires model names on a rolling basis
+    // (2.0 Flash was shut off in June 2026), so the real list comes from the
+    // Find button, and a dead name is auto-repaired on first use.
     name: 'Google Gemini — free tier',
     defaultModel: 'gemini-2.5-flash',
-    suggest: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'],
+    suggest: ['gemini-2.5-flash', 'gemini-2.5-flash-lite'],
     keyHint: 'aistudio.google.com/apikey',
     keyUrl: 'https://aistudio.google.com/apikey',
   },
@@ -423,9 +428,11 @@ async function apiFail(res, who) {
     lead = 'This key is restricted to certain websites and your page is not on the list. '
          + 'In Google AI Studio or Cloud Console, either remove the restriction or add '
          + `"${location.origin}/*" to the allowed referrers.`;
-  } else if (/api key not valid|invalid api key|api_key_invalid/.test(d)) {
-    lead = 'Google says the key itself is not valid. Re-copy it from aistudio.google.com/apikey — '
-         + 'keys start with "AIza" and are about 39 characters.';
+  } else if (/api key not valid|invalid api key|api_key_invalid|standard key|auth key/.test(d)) {
+    lead = state.settings.apiKey.startsWith('AIza')
+      ? 'This is an older "standard" Google key (AIza…). Google stopped accepting these in 2026. '
+        + 'Create a new key at aistudio.google.com/apikey — it will start with "AQ.Ab" — and paste that instead.'
+      : 'Google says the key is not valid. Re-copy it from aistudio.google.com/apikey.';
   } else if (/expired/.test(d)) {
     lead = 'This key has expired. Create a new one.';
   } else if (res.status === 401 || res.status === 403) {
@@ -434,8 +441,10 @@ async function apiFail(res, who) {
     lead = who === 'Gemini'
       ? 'Free-tier limit hit. Wait a minute, or switch to Flash-Lite in Settings.'
       : 'Rate limited — wait a moment and retry.';
-  } else if (res.status === 404) {
-    lead = `Model "${state.settings.model}" was not found. Change it in Settings.`;
+  } else if (res.status === 404 || /not found|not supported|unsupported model/.test(d)) {
+    lead = `Model "${state.settings.model}" does not exist for this key. `
+         + 'Google retires model names regularly. Open Settings and press Find next to the '
+         + 'Model box — it lists the models your key can actually use and picks the best one.';
   } else if (/credit|balance|quota/.test(d)) {
     lead = `${who} account is out of credit or quota.`;
   } else {
@@ -445,7 +454,7 @@ async function apiFail(res, who) {
   throw new Error(detail && !lead.includes(detail) ? `${lead}\n\nGoogle said: ${detail}` : lead);
 }
 
-async function askGemini(imageB64, mediaType, prompt) {
+async function askGemini(imageB64, mediaType, prompt, retried = false) {
   const url = `${GEMINI_URL}${encodeURIComponent(state.settings.model)}:generateContent`;
   const res = await fetch(url, {
     method: 'POST',
@@ -468,13 +477,45 @@ async function askGemini(imageB64, mediaType, prompt) {
     }),
   });
 
-  if (!res.ok) await apiFail(res, 'Gemini');
+  if (!res.ok) {
+    // A retired model name shouldn't need manual intervention: look up what
+    // this key can use, switch to it permanently, and retry once.
+    if (await recoverModel(res, retried)) {
+      return askGemini(imageB64, mediaType, prompt, true);
+    }
+    await apiFail(res, 'Gemini');
+  }
 
   const json = await res.json();
   const cand = json.candidates?.[0];
   if (!cand) throw new Error('Gemini returned nothing. Try a clearer photo.');
   if (cand.finishReason === 'SAFETY') throw new Error('Gemini blocked that image.');
   return (cand.content?.parts || []).map(p => p.text || '').join('');
+}
+
+/** True if the failure was "model not found" AND we successfully switched. */
+async function recoverModel(res, alreadyRetried) {
+  if (alreadyRetried || state.settings.provider !== 'gemini') return false;
+  if (res.status !== 404 && res.status !== 400) return false;
+
+  let detail = '';
+  try { detail = (await res.clone().json())?.error?.message || ''; } catch {}
+  if (!/not found|not supported|unsupported model|is not available/i.test(detail)
+      && res.status !== 404) return false;
+
+  try {
+    const models = await listGeminiModels();
+    const old = state.settings.model;
+    if (!models.length || models[0] === old) return false;
+    state.settings.model = models[0];
+    save();
+    toast(`${old} is retired — switched to ${models[0]}`);
+    console.info(`Model auto-migrated: ${old} -> ${models[0]}`);
+    return true;
+  } catch (err) {
+    console.warn('Model auto-recovery failed:', err);
+    return false;
+  }
 }
 
 async function askAnthropic(imageB64, mediaType, prompt) {
@@ -1253,9 +1294,12 @@ function openSettings() {
       </div>
       <div>
         <label for="s-model">Model</label>
-        <input id="s-model" type="text" list="s-models" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <div style="display:flex;gap:8px">
+          <input id="s-model" type="text" list="s-models" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <button id="s-find" class="act" type="button" style="flex:none;padding:11px 14px">Find</button>
+        </div>
         <datalist id="s-models"></datalist>
-        <p class="hint">Editable on purpose — if a model name is retired, change it here instead of editing code.</p>
+        <p class="hint" id="s-modelhint">Google retires model names regularly. Press Find to list the ones your key can actually use and pick the best.</p>
       </div>
       <div class="row">
         <div><label for="s-cal">Daily calories</label><input id="s-cal" type="number" min="0" step="10"></div>
@@ -1304,6 +1348,43 @@ function openSettings() {
     };
     syncProvider(false);
 
+    const findBtn = wrap.querySelector('#s-find');
+    const modelHint = wrap.querySelector('#s-modelhint');
+    findBtn.onclick = async () => {
+      if (provEl.value !== 'gemini') {
+        modelHint.textContent = 'Model discovery is only available for Gemini.';
+        return;
+      }
+      // Use whatever is typed right now, so this works before the first Save.
+      const typed = keyEl.value.replace(/\s+/g, '');
+      if (!typed) {
+        modelHint.textContent = 'Paste your API key first.';
+        modelHint.style.color = 'var(--danger)';
+        return;
+      }
+      const previous = state.settings.apiKey;
+      state.settings.apiKey = typed;
+
+      findBtn.disabled = true;
+      findBtn.textContent = '…';
+      modelHint.style.color = '';
+      modelHint.textContent = 'Asking Google which models this key can use…';
+      try {
+        const models = await listGeminiModels();
+        listEl.replaceChildren();
+        for (const m of models) listEl.append(new Option(m));
+        modelEl.value = models[0];
+        modelHint.textContent = `${models.length} models available. Picked ${models[0]} — open the dropdown to choose another. Press Save to keep it.`;
+        modelHint.style.color = 'var(--pro)';
+      } catch (err) {
+        state.settings.apiKey = previous;
+        modelHint.textContent = err.message;
+        modelHint.style.color = 'var(--danger)';
+      }
+      findBtn.disabled = false;
+      findBtn.textContent = 'Find';
+    };
+
     const saveBtn = document.createElement('button');
     saveBtn.className = 'primary';
     saveBtn.type = 'button';
@@ -1313,8 +1394,8 @@ function openSettings() {
       // Strip ALL whitespace, not just the ends: copying from a web page or a
       // wrapped terminal line can embed spaces or newlines mid-key.
       const key = keyEl.value.replace(/\s+/g, '');
-      const warn = keyProblem(key, provEl.value);
-      if (warn) { toast(warn, true); keyEl.focus(); return; }
+      // Advisory only. Always save — the API decides what is valid, not us.
+      const note = keyProblem(key, provEl.value);
       state.settings.apiKey = key;
       state.settings.provider = provEl.value;
       state.settings.model = modelEl.value.trim() || PROVIDERS[provEl.value].defaultModel;
@@ -1322,8 +1403,15 @@ function openSettings() {
       state.targets.protein = Math.max(0, Number(proEl.value) || 0);
       save();
       render();
-      closeModal();
-      toast('Saved');
+      if (note) {
+        // Keep the panel open so the caution is readable, but the key IS saved.
+        modelHint.textContent = `Saved. Note: ${note}`;
+        modelHint.style.color = 'var(--cal)';
+        toast('Saved');
+      } else {
+        closeModal();
+        toast('Saved');
+      }
     };
     body.append(saveBtn);
 
@@ -1359,18 +1447,58 @@ function openSettings() {
   });
 }
 
-/** Catch the obvious paste mistakes before a round trip to the API. */
+/* Model IDs are retired and renamed constantly — 2.0 Flash was shut off in
+   June 2026 and now 404s. Rather than ship a name that rots, ask the key what
+   it can actually use. */
+async function listGeminiModels() {
+  if (!state.settings.apiKey) throw new Error('Save an API key first.');
+  const res = await fetch(`${GEMINI_LIST}?pageSize=200`, {
+    headers: { 'x-goog-api-key': state.settings.apiKey },
+  });
+  if (!res.ok) await apiFail(res, 'Gemini');
+  const json = await res.json();
+  const usable = (json.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => String(m.name || '').replace(/^models\//, ''))
+    .filter(Boolean);
+  if (!usable.length) throw new Error('This key has no models that support generateContent.');
+  return usable.sort((a, b) => rankModel(b) - rankModel(a));
+}
+
+/** Prefer a current, stable Flash model: multimodal, cheap, on the free tier. */
+function rankModel(id) {
+  let s = 0;
+  if (/flash/i.test(id)) s += 100;          // free tier + vision
+  if (/lite/i.test(id)) s -= 25;            // weaker at reading labels
+  if (/preview|exp|thinking|tts|image/i.test(id)) s -= 60;  // unstable or wrong modality
+  if (/pro/i.test(id)) s -= 80;             // paid-only on the free tier
+  const v = parseFloat((id.match(/(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  return s + v * 3;                         // newer wins among equals
+}
+
+/* ADVISORY ONLY — never blocks a save. Key formats change (Google moved from
+   AIza "standard" keys to AQ.Ab "auth" keys during 2026 and began rejecting
+   the old ones), so the API is the only real authority on whether a key is
+   valid. A hard format check here would lock users out of working keys. */
 function keyProblem(key, provider) {
-  if (!key) return null;                       // empty is allowed — no photo modes
+  if (!key) return null;
+
   if (provider === 'gemini') {
-    if (key.startsWith('sk-ant-')) return 'That is an Anthropic key. Switch the provider, or paste a Gemini key.';
-    if (key.startsWith('sk-')) return 'That looks like an OpenAI key, which this app cannot use.';
-    if (!key.startsWith('AIza')) return 'Gemini keys start with "AIza". Re-copy it from aistudio.google.com/apikey.';
-    if (key.length < 30) return `That key looks truncated (${key.length} characters; expected about 39).`;
+    if (key.startsWith('sk-ant-')) return 'This looks like an Anthropic key — you may want to switch the provider above.';
+    if (/^sk-/.test(key)) return 'This looks like an OpenAI key, which this app cannot use.';
+    if (key.startsWith('AIza')) {
+      return 'This is an older "standard" Google key. Google began rejecting these in 2026 — '
+           + 'if it fails, create a new key at aistudio.google.com/apikey, which now issues "AQ.Ab" auth keys.';
+    }
+    if (!/^AQ\./.test(key)) {
+      return 'Unfamiliar key format (current Gemini keys start with "AQ."). Saved anyway — press Test API key to find out for certain.';
+    }
+    if (key.length < 20) return `This looks truncated (only ${key.length} characters).`;
   }
+
   if (provider === 'anthropic') {
-    if (key.startsWith('AIza')) return 'That is a Gemini key. Switch the provider, or paste an Anthropic key.';
-    if (!key.startsWith('sk-ant-')) return 'Anthropic keys start with "sk-ant-".';
+    if (/^(AIza|AQ\.)/.test(key)) return 'This looks like a Google key — you may want to switch the provider above.';
+    if (!key.startsWith('sk-ant-')) return 'Anthropic keys usually start with "sk-ant-".';
   }
   return null;
 }
@@ -1389,7 +1517,12 @@ async function testKey() {
         generationConfig: { maxOutputTokens: 10 },
       }),
     });
-    if (!res.ok) await apiFail(res, 'Gemini');
+    if (!res.ok) {
+      if (await recoverModel(res, false)) {
+        return `${model} is retired. Switched to ${state.settings.model}, which works.`;
+      }
+      await apiFail(res, 'Gemini');
+    }
     return `Key works with ${model}.`;
   }
 
@@ -1424,6 +1557,7 @@ function addDiagnostics(body) {
   const secure = window.isSecureContext;
   const hasCam = !!navigator.mediaDevices?.getUserMedia;
   const rows = [
+    ['App version', `v${APP_VERSION}`],
     ['Page address', `${location.protocol}//${location.host || 'file'}`],
     ['Secure context', secure ? 'yes' : 'NO — camera will be blocked'],
     ['Camera API', hasCam ? 'available' : 'MISSING'],
