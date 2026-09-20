@@ -42,7 +42,9 @@ Open the URL. Search, barcode scanning and manual entry all work immediately. Fo
 
 Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free, no card. Paste it into the app's Settings panel, never into the code.
 
-Keys issued now are **auth keys** and start with `AQ.Ab`. The older **standard keys** starting with `AIza` were phased out during 2026 and Google rejects them, so if you have one lying around from an older project, create a fresh key rather than reusing it. The app warns about this but never blocks you — key formats change, and only the API can say for certain whether a key works.
+Use the **Create API key** button in AI Studio and copy the single string it gives you. Google keys generally start with `AIza`, though other formats exist; the app accepts anything and lets the API be the judge, since a format check that guesses wrong just locks you out of a working key.
+
+What definitely will *not* work, and is easy to grab by mistake from the Cloud Console, is an OAuth 2.0 Client ID (ends in `.apps.googleusercontent.com`), a client secret, or service-account JSON. Those produce a 401 saying Google "expected OAuth 2 access token", which reads like a key problem but means the wrong kind of credential was sent. Settings → Diagnostics names the credential type it can see, without revealing the value.
 
 Then press **Find** next to the Model box. Google retires model names on a rolling basis (2.0 Flash was shut off in June 2026 and now returns 404), so rather than trusting a hardcoded default, the app asks your key which models it can actually use and picks the best current Flash one. Do this again if photo modes ever start failing with a "model not found" error.
 

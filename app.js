@@ -6,11 +6,17 @@
 // ─────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────
-const APP_VERSION = 9;   // must match the ?v= in index.html
+const APP_VERSION = 13;   // must match the ?v= in index.html
 const STORE_KEY = 'macrolog.v1';
 const RING_C = 2 * Math.PI * 52;          // circumference of r=52 ring
 const OFF_URL = 'https://world.openfoodfacts.org/api/v2/product/';
 const OFF_SEARCH = 'https://world.openfoodfacts.org/cgi/search.pl';
+/* USDA FoodData Central: free, and far better than Open Food Facts for whole
+   foods (raw chicken, rice, fruit) rather than packaged goods. Its key goes in
+   the query string because that is the only method the API accepts. DEMO_KEY
+   is Google's published shared key — fine to start with, heavily rate-limited. */
+const USDA_SEARCH = 'https://api.nal.usda.gov/fdc/v1/foods/search';
+const USDA_DEMO = 'DEMO_KEY';
 const ZXING_CDN = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
@@ -48,7 +54,7 @@ const SOURCE_LABEL = {
 const DEFAULTS = {
   entries: [],
   targets: { calories: 2000, protein: 150 },
-  settings: { apiKey: '', provider: 'gemini', model: 'gemini-2.5-flash' },
+  settings: { apiKey: '', provider: 'gemini', model: 'gemini-2.5-flash', usdaKey: '' },
 };
 
 let state = load();
@@ -329,6 +335,8 @@ function spinner(container, text) {
   p.style.textAlign = 'center';
   p.textContent = text;
   container.append(s, p);
+  statusEl = p;   // fetchRetry writes countdowns here instead of freezing
+  return p;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -402,6 +410,71 @@ async function decodeImage(file) {
   }
 }
 
+/* Transient server-side failures. 503 in particular is Gemini saying the model
+   is overloaded — common on the free tier at busy times and nothing to do with
+   the request. Retrying with backoff fixes it far more often than not. */
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+
+let statusEl = null;   // spinner caption, so waits are visible rather than a freeze
+
+async function fetchRetry(url, opts, attempts = 4) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    let res;
+    try {
+      res = await fetch(url, opts);
+    } catch (err) {
+      // Network-level failure: the request never reached the server, so there
+      // is no status code to interpret. "Failed to fetch" alone is useless.
+      if (i === attempts - 1) throw networkError(err, url);
+      await backoff(i, 'Connection failed');
+      continue;
+    }
+
+    if (!RETRYABLE.has(res.status)) return res;
+    last = res;
+    if (i === attempts - 1) return res;
+
+    // Honour Retry-After when the server sends one.
+    const ra = Number(res.headers?.get?.('retry-after'));
+    const why = res.status === 503 ? 'Google is busy'
+              : res.status === 429 ? 'Rate limited'
+              : `Server error ${res.status}`;
+    await backoff(i, why, Number.isFinite(ra) && ra > 0 ? ra * 1000 : null);
+  }
+  return last;
+}
+
+/* "Failed to fetch" is what the browser says for every network-layer refusal:
+   offline, DNS failure, a blocked domain, or a CORS rejection. The browser
+   deliberately hides which, so name the realistic causes instead. */
+function networkError(err, url) {
+  let host = url;
+  try { host = new URL(url).hostname; } catch {}
+
+  if (navigator.onLine === false) {
+    return new Error(`You appear to be offline. Reconnect and try again.\n\n(${host} was unreachable.)`);
+  }
+  return new Error(
+    `Could not reach ${host} — the request was blocked before it left your browser.\n\n`
+    + 'Most likely one of:\n'
+    + '• A content or ad blocker, or a privacy extension, blocking Google domains. '
+    + 'Try disabling it for this site, or open the page in a private window with extensions off.\n'
+    + '• A school, work or public network filtering the domain. Try a different network or a phone hotspot.\n'
+    + '• A VPN or DNS filter.\n\n'
+    + 'Barcode, search and manual entry do not use Google and should still work. '
+    + 'Settings → Diagnostics → Test connection shows exactly which services are reachable.'
+  );
+}
+
+function backoff(attempt, why, explicitMs) {
+  // 1s, 2s, 4s plus jitter, so parallel clients don't retry in lockstep.
+  const ms = explicitMs ?? (2 ** attempt * 1000 + Math.random() * 400);
+  const secs = Math.ceil(ms / 1000);
+  if (statusEl) statusEl.textContent = `${why} — retrying in ${secs}s…`;
+  return new Promise(r => setTimeout(r, ms));
+}
+
 async function askVision(imageB64, mediaType, prompt) {
   return state.settings.provider === 'anthropic'
     ? askAnthropic(imageB64, mediaType, prompt)
@@ -421,7 +494,15 @@ async function apiFail(res, who) {
   const d = detail.toLowerCase();
   let lead;
 
-  if (/has not been used in project|is disabled|enable the api|serviceusage/.test(d)) {
+  if (/expected oauth 2|oauth2|login cookie|invalid authentication credential/.test(d)) {
+    // Google only says this when it saw no usable API key — so the value that
+    // was sent is not an API key, rather than being a wrong one.
+    lead = 'Google did not recognise what was sent as an API key at all. '
+         + 'The usual cause is copying the wrong value: an OAuth 2.0 Client ID '
+         + '(ends in .apps.googleusercontent.com), a client secret, or a service-account '
+         + 'JSON field instead of the key. Go to aistudio.google.com/apikey, press '
+         + '"Create API key", and copy the single string it shows you.';
+  } else if (/has not been used in project|is disabled|enable the api|serviceusage/.test(d)) {
     lead = 'The Generative Language API is not enabled on the key\'s Google Cloud project. '
          + 'Open the link in the error below and click Enable, then wait a minute.';
   } else if (/referer|referrer|not authorized to use this api|api_key_http_referrer/.test(d)) {
@@ -437,6 +518,12 @@ async function apiFail(res, who) {
     lead = 'This key has expired. Create a new one.';
   } else if (res.status === 401 || res.status === 403) {
     lead = `${who} refused the request (${res.status}).`;
+  } else if (res.status === 503 || /overloaded|unavailable/.test(d)) {
+    lead = 'Google\'s servers are overloaded right now — this is on their side, not yours, '
+         + 'and your key is fine. The app already retried several times. '
+         + 'Try again in a minute, or use barcode/search in the meantime, which do not touch Google at all.';
+  } else if (res.status === 500 || res.status === 502 || res.status === 504) {
+    lead = `${who} had a server error (${res.status}) that did not clear after retrying. Nothing wrong on your end — try again shortly.`;
   } else if (res.status === 429) {
     lead = who === 'Gemini'
       ? 'Free-tier limit hit. Wait a minute, or switch to Flash-Lite in Settings.'
@@ -456,7 +543,7 @@ async function apiFail(res, who) {
 
 async function askGemini(imageB64, mediaType, prompt, retried = false) {
   const url = `${GEMINI_URL}${encodeURIComponent(state.settings.model)}:generateContent`;
-  const res = await fetch(url, {
+  const res = await fetchRetry(url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -519,7 +606,7 @@ async function recoverModel(res, alreadyRetried) {
 }
 
 async function askAnthropic(imageB64, mediaType, prompt) {
-  const res = await fetch(ANTHROPIC_URL, {
+  const res = await fetchRetry(ANTHROPIC_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -1018,6 +1105,38 @@ function flowManual() {
   });
 }
 
+/* USDA results are reshaped to look like Open Food Facts products, so the
+   portion picker downstream needs no knowledge of where a result came from. */
+async function searchUSDA(q) {
+  const key = state.settings.usdaKey || USDA_DEMO;
+  const url = `${USDA_SEARCH}?api_key=${encodeURIComponent(key)}`
+    + `&query=${encodeURIComponent(q)}&pageSize=10`
+    + '&dataType=Foundation,SR%20Legacy,Survey%20(FNDDS)';
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`USDA search failed (${res.status})`);
+  const json = await res.json();
+
+  return (json.foods || []).map(f => {
+    const n = {};
+    for (const x of f.foodNutrients || []) {
+      // 1008 = Energy (kcal), 1003 = Protein. Values are per 100 g.
+      if (x.nutrientId === 1008 || (x.nutrientName === 'Energy' && x.unitName === 'KCAL')) {
+        n['energy-kcal_100g'] = x.value;
+      }
+      if (x.nutrientId === 1003) n['proteins_100g'] = x.value;
+    }
+    return {
+      product_name: f.description,
+      brands: f.brandOwner || 'USDA',
+      code: `usda-${f.fdcId}`,
+      serving_size: '',
+      nutriments: n,
+      _src: 'USDA',
+    };
+  }).filter(p => num(p.nutriments['energy-kcal_100g']) != null);
+}
+
 /** Free-text lookup against Open Food Facts. No key, no AI, no cost. */
 function addSearchBox(body) {
   const wrap = document.createElement('div');
@@ -1046,22 +1165,37 @@ function addSearchBox(body) {
     loading.textContent = 'Searching…';
     results.append(loading);
 
-    try {
+    // Query both sources at once: USDA is strong on whole foods, Open Food
+    // Facts on packaged goods. settled() so one failing never loses the other.
+    const offPromise = (async () => {
       const url = `${OFF_SEARCH}?search_terms=${encodeURIComponent(q)}`
-        + '&search_simple=1&action=process&json=1&page_size=12'
+        + '&search_simple=1&action=process&json=1&page_size=10'
         + '&fields=code,product_name,brands,nutriments,serving_size';
       const res = await fetch(url);
-      if (!res.ok) throw new Error(`Search failed (${res.status})`);
+      if (!res.ok) throw new Error(`Open Food Facts ${res.status}`);
       const json = await res.json();
+      return (json.products || [])
+        .filter(p => p.product_name && num(p.nutriments?.['energy-kcal_100g']) != null)
+        .map(p => ({ ...p, _src: 'Open Food Facts' }));
+    })();
 
-      const hits = (json.products || []).filter(p =>
-        p.product_name && num(p.nutriments?.['energy-kcal_100g']) != null);
+    const [usdaRes, offRes] = await Promise.allSettled([searchUSDA(q), offPromise]);
+    const usdaHits = usdaRes.status === 'fulfilled' ? usdaRes.value : [];
+    const offHits = offRes.status === 'fulfilled' ? offRes.value : [];
+    if (usdaRes.status === 'rejected') console.warn('USDA search failed:', usdaRes.reason);
+    if (offRes.status === 'rejected') console.warn('OFF search failed:', offRes.reason);
+
+    try {
+      // USDA first: authoritative, and usually what you want for a plain food.
+      const hits = [...usdaHits, ...offHits];
 
       results.replaceChildren();
       if (!hits.length) {
         const p = document.createElement('p');
         p.className = 'hint';
-        p.textContent = `Nothing usable found for "${q}". Try a simpler word, or enter it by hand below.`;
+        p.textContent = (usdaRes.status === 'rejected' && offRes.status === 'rejected')
+          ? 'Could not reach either food database. Check Settings → Diagnostics → Test connection, or enter it by hand below.'
+          : `Nothing found for "${q}". Try a simpler word, or enter it by hand below.`;
         results.append(p);
         return;
       }
@@ -1079,7 +1213,7 @@ function addSearchBox(body) {
         nm.textContent = prod.product_name;
         const sb = document.createElement('div');
         sb.className = 'f-sub';
-        sb.textContent = prod.brands || '';
+        sb.textContent = [prod._src, prod.brands].filter(Boolean).join(' · ');
         main.append(nm, sb);
 
         const nums = document.createElement('div');
@@ -1301,6 +1435,11 @@ function openSettings() {
         <datalist id="s-models"></datalist>
         <p class="hint" id="s-modelhint">Google retires model names regularly. Press Find to list the ones your key can actually use and pick the best.</p>
       </div>
+      <div>
+        <label for="s-usda">USDA food database key (optional)</label>
+        <input id="s-usda" type="text" placeholder="DEMO_KEY" autocomplete="off" spellcheck="false">
+        <p class="hint">Search already works without this using the shared DEMO_KEY, which is rate-limited. A free key from <a href="https://fdc.nal.usda.gov/api-key-signup/" target="_blank" rel="noopener">fdc.nal.usda.gov</a> raises the limit to 1,000 lookups an hour.</p>
+      </div>
       <div class="row">
         <div><label for="s-cal">Daily calories</label><input id="s-cal" type="number" min="0" step="10"></div>
         <div><label for="s-pro">Daily protein (g)</label><input id="s-pro" type="number" min="0" step="5"></div>
@@ -1313,6 +1452,7 @@ function openSettings() {
     const hintEl = wrap.querySelector('#s-keyhint');
     const modelEl = wrap.querySelector('#s-model');
     const listEl = wrap.querySelector('#s-models');
+    const usdaEl = wrap.querySelector('#s-usda');
     const calEl = wrap.querySelector('#s-cal');
     const proEl = wrap.querySelector('#s-pro');
 
@@ -1320,6 +1460,7 @@ function openSettings() {
     provEl.value = PROVIDERS[state.settings.provider] ? state.settings.provider : 'gemini';
     keyEl.value = state.settings.apiKey;
     modelEl.value = state.settings.model;
+    usdaEl.value = state.settings.usdaKey || '';
     calEl.value = state.targets.calories;
     proEl.value = state.targets.protein;
 
@@ -1399,6 +1540,7 @@ function openSettings() {
       state.settings.apiKey = key;
       state.settings.provider = provEl.value;
       state.settings.model = modelEl.value.trim() || PROVIDERS[provEl.value].defaultModel;
+      state.settings.usdaKey = usdaEl.value.replace(/\s+/g, '');
       state.targets.calories = Math.max(0, Number(calEl.value) || 0);
       state.targets.protein = Math.max(0, Number(proEl.value) || 0);
       save();
@@ -1452,7 +1594,7 @@ function openSettings() {
    it can actually use. */
 async function listGeminiModels() {
   if (!state.settings.apiKey) throw new Error('Save an API key first.');
-  const res = await fetch(`${GEMINI_LIST}?pageSize=200`, {
+  const res = await fetchRetry(`${GEMINI_LIST}?pageSize=200`, {
     headers: { 'x-goog-api-key': state.settings.apiKey },
   });
   if (!res.ok) await apiFail(res, 'Gemini');
@@ -1484,14 +1626,22 @@ function keyProblem(key, provider) {
   if (!key) return null;
 
   if (provider === 'gemini') {
+    // Definitely the wrong credential type — these can never work.
+    if (/\.apps\.googleusercontent\.com$/.test(key)) {
+      return 'This is an OAuth Client ID, not an API key. In Google AI Studio press "Create API key" and copy that instead.';
+    }
+    if (/^\{|"type"\s*:/.test(key)) {
+      return 'This looks like service-account JSON. Paste only the API key string from aistudio.google.com/apikey.';
+    }
+    if (/^ya29\./.test(key)) {
+      return 'This is a short-lived OAuth access token, not an API key.';
+    }
     if (key.startsWith('sk-ant-')) return 'This looks like an Anthropic key — you may want to switch the provider above.';
     if (/^sk-/.test(key)) return 'This looks like an OpenAI key, which this app cannot use.';
-    if (key.startsWith('AIza')) {
-      return 'This is an older "standard" Google key. Google began rejecting these in 2026 — '
-           + 'if it fails, create a new key at aistudio.google.com/apikey, which now issues "AQ.Ab" auth keys.';
-    }
-    if (!/^AQ\./.test(key)) {
-      return 'Unfamiliar key format (current Gemini keys start with "AQ."). Saved anyway — press Test API key to find out for certain.';
+    // Both AIza (standard) and AQ. (auth) keys exist in the wild; neither is
+    // treated as wrong here, because only the API can actually decide.
+    if (!/^(AIza|AQ\.)/.test(key)) {
+      return 'Unfamiliar format — Google keys usually start with "AIza" or "AQ.". Saved anyway; press Test API key to find out for certain.';
     }
     if (key.length < 20) return `This looks truncated (only ${key.length} characters).`;
   }
@@ -1509,7 +1659,7 @@ async function testKey() {
   if (!apiKey) throw new Error('No API key saved yet.');
 
   if (provider === 'gemini') {
-    const res = await fetch(`${GEMINI_URL}${encodeURIComponent(model)}:generateContent`, {
+    const res = await fetchRetry(`${GEMINI_URL}${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
@@ -1526,7 +1676,7 @@ async function testKey() {
     return `Key works with ${model}.`;
   }
 
-  const res = await fetch(ANTHROPIC_URL, {
+  const res = await fetchRetry(ANTHROPIC_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -1541,6 +1691,17 @@ async function testKey() {
   });
   if (!res.ok) await apiFail(res, 'Anthropic');
   return `Key works with ${model}.`;
+}
+
+/* Show enough to identify WHICH credential was pasted, without revealing it.
+   A client ID or service-account field is visibly different from a key. */
+function describeKey(key) {
+  if (!key) return 'not set — photo modes disabled';
+  const head = key.slice(0, 6);
+  if (/\.apps\.googleusercontent\.com$/.test(key)) return 'OAuth CLIENT ID, not an API key';
+  if (/^\{|"type"\s*:/.test(key)) return 'service-account JSON, not an API key';
+  if (/^ya29\./.test(key)) return 'OAuth access token, not an API key';
+  return `${head}… (${key.length} chars)`;
 }
 
 /** What this browser actually supports. Turns "it doesn't work" into a fact. */
@@ -1563,8 +1724,9 @@ function addDiagnostics(body) {
     ['Camera API', hasCam ? 'available' : 'MISSING'],
     ['Barcode scanner', 'BarcodeDetector' in window ? 'native' : 'ZXing fallback (needs internet)'],
     ['Image decoding', typeof createImageBitmap === 'function' ? 'fast path' : 'fallback path'],
-    ['API key', state.settings.apiKey ? `set (${state.settings.apiKey.length} chars)` : 'not set — photo modes disabled'],
+    ['API key', describeKey(state.settings.apiKey)],
     ['Provider', `${state.settings.provider} / ${state.settings.model}`],
+    ['Food database', `Open Food Facts + USDA (${state.settings.usdaKey ? 'own key' : 'DEMO_KEY'})`],
   ];
 
   const tbl = document.createElement('div');
@@ -1583,6 +1745,47 @@ function addDiagnostics(body) {
     tbl.append(line);
   }
   body.append(tbl);
+
+  const netBtn = document.createElement('button');
+  netBtn.className = 'act';
+  netBtn.type = 'button';
+  netBtn.style.marginTop = '12px';
+  netBtn.textContent = 'Test connection';
+  netBtn.onclick = async () => {
+    document.getElementById('net-result')?.remove();
+    netBtn.disabled = true;
+    netBtn.textContent = 'Testing…';
+
+    const out = document.createElement('p');
+    out.id = 'net-result';
+    out.className = 'hint';
+    out.style.whiteSpace = 'pre-wrap';
+
+    // Reachability only — a 4xx still proves the domain is not blocked.
+    const targets = [
+      ['Google (AI)', `${GEMINI_LIST}?pageSize=1`],
+      ['Open Food Facts', `${OFF_URL}0000000000000.json`],
+      ['USDA database', `${USDA_SEARCH}?api_key=${encodeURIComponent(state.settings.usdaKey || USDA_DEMO)}&query=egg&pageSize=1`],
+      ['jsDelivr (scanner)', ZXING_CDN],
+    ];
+    const lines = [];
+    for (const [label, url] of targets) {
+      try {
+        const r = await fetch(url, { method: 'GET' });
+        lines.push(`${label}: reachable (HTTP ${r.status})`);
+      } catch {
+        lines.push(`${label}: BLOCKED — request never left the browser`);
+      }
+    }
+    lines.push(`Browser reports online: ${navigator.onLine !== false ? 'yes' : 'no'}`);
+
+    out.textContent = lines.join('\n');
+    out.style.color = lines.some(l => l.includes('BLOCKED')) ? 'var(--danger)' : 'var(--pro)';
+    netBtn.disabled = false;
+    netBtn.textContent = 'Test connection';
+    netBtn.after(out);
+  };
+  body.append(netBtn);
 
   const keyBtn = document.createElement('button');
   keyBtn.className = 'act';
